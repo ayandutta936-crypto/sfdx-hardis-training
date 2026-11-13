@@ -14,10 +14,11 @@
  *   training-universe.json stories -> site-src/[<locale>/]BACKLOG/US-nnn.md, and US-nnn.json once
  *   badges/<trailblazer>.json      -> site-src/[<locale>/]badges/<trailblazer>.md, built from the record
  *   badges/<trailblazer>.json      -> site-src/badges/<trailblazer>.json (read by other sites)
- *   hall-of-fame/hall-of-fame.json -> site-src/[<locale>/]hall-of-fame/index.md, and the JSON once (read by the game)
+ *   the Hall of Fame -> site-src/[<locale>/]hall-of-fame/index.md (the boards are read in the browser)
  *
  *   node scripts/build/site.mjs
  */
+import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -696,31 +697,11 @@ function statsPages() {
 const statsPageCount = statsPages();
 
 /**
- * The Guinea Run Hall of Fame, in every language, and the board itself.
- *
- * hall-of-fame/hall-of-fame.json is written by the hall-of-fame workflow. The
- * game reads it from GitHub first and from the copy published here second, so
- * the copy is written even when the board cannot be read: an empty one then.
+ * The Guinea Run Hall of Fame, in every language. The boards are read from the
+ * game's database in the reader's browser (site-theme/javascripts/hall-of-fame-page.js):
+ * the page holds their places only.
  */
 function hallOfFamePages() {
-  let board = { version: 1, updatedAt: null, banned: [], players: {} };
-  try {
-    board = JSON.parse(fs.readFileSync(path.join(ROOT, "hall-of-fame", "hall-of-fame.json"), "utf8"));
-  } catch (error) {
-    console.warn(`hall-of-fame/hall-of-fame.json could not be read, the Hall of Fame page is empty: ${error.message}`);
-  }
-  fs.mkdirSync(path.join(OUT, "hall-of-fame"), { recursive: true });
-  fs.writeFileSync(path.join(OUT, "hall-of-fame", "hall-of-fame.json"), JSON.stringify(board, null, 2) + "\n", "utf8");
-
-  // The badge page of a player: the record of their GitHub handle with the highest badge
-  const byHandle = new Map();
-  for (const holder of holders) {
-    const handle = String(holder.recipient || "").toLowerCase();
-    const level = holder.highest ? holder.highest.level : 0;
-    if (handle && level > 0 && (!byHandle.has(handle) || byHandle.get(handle).highest.level < level)) {
-      byHandle.set(handle, holder);
-    }
-  }
   for (const locale of locales) {
     const s = strings(locale);
     const dir = path.join(OUT, localePrefix(locale), "hall-of-fame");
@@ -729,24 +710,9 @@ function hallOfFamePages() {
     for (const other of locales) {
       alternates[other] = `${localePrefix(other)}hall-of-fame/`;
     }
-    // The badge images are published once, under the site language
-    const images = locale === SITE_LANG ? "../badges/img" : "../../badges/img";
-    const page = hallOfFamePage({
-      s,
-      board,
-      badgeHref: (handle) => {
-        const holder = byHandle.get(handle.toLowerCase());
-        return holder ? `../badges/${holder.key}.md` : null;
-      },
-      badgeImage: (handle, level) => {
-        const holder = byHandle.get(handle.toLowerCase());
-        const file = holder ? `${holder.key}-level-${level}.svg` : null;
-        return file && fs.existsSync(path.join(badgesDir, "img", file)) ? `${images}/${file}` : null;
-      }
-    });
     fs.writeFileSync(
       path.join(dir, "index.md"),
-      withAlternates(frontMatter({ title: s.hallOfFame.title, description: s.hallOfFame.description }) + page, alternates, locale),
+      withAlternates(frontMatter({ title: s.hallOfFame.title, description: s.hallOfFame.description }) + hallOfFamePage({ s }), alternates, locale),
       "utf8"
     );
   }
@@ -754,4 +720,68 @@ function hallOfFamePages() {
 }
 const hallOfFamePageCount = hallOfFamePages();
 
-console.log(`site-src assembled: ${pages} lab page(s), ${backlogs} backlog page(s), ${stories} story page(s), ${assets} asset(s), ${themeFiles} theme file(s), ${badgePageCount} badge page(s), ${statsPageCount} statistics page(s), ${hallOfFamePageCount} Hall of Fame page(s), ${badgeRecords} badge record(s), ${locales.length} locale(s)`);
+/**
+ * Guinea Run offline: the service worker next to play.html saves the files the
+ * game loads (itself, its pictures, its fonts, the badge banners), listed here
+ * from what was just assembled, with a version that changes with any of them
+ * or with Three.js. Written into the built sw.js; the source keeps "dev".
+ */
+function guineaRunOfflineFiles() {
+  const gameDir = path.join(OUT, "theme", "javascripts", "guinea-run");
+  const files = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+      } else if (!entry.name.endsWith(".txt") && full !== path.join(gameDir, "sw.js")) {
+        files.push(full);
+      }
+    }
+  };
+  walk(gameDir);
+  const images = path.join(OUT, "theme", "images");
+  for (const name of ["guinea-pig.webp", "guinea-pig-small.webp", "mariia.svg", "romain.svg", "cloudity-text-logo-white.svg"]) {
+    files.push(path.join(images, name));
+  }
+  for (const name of fs.readdirSync(path.join(images, "bosses")).filter((n) => n.endsWith(".svg")).sort()) {
+    files.push(path.join(images, "bosses", name));
+  }
+  for (const name of ["open-sans-latin.woff2", "jetbrains-mono-latin.woff2"]) {
+    files.push(path.join(OUT, "theme", "stylesheets", "fonts", name));
+  }
+  for (const level of [1, 2, 3]) {
+    files.push(path.join(OUT, "badges", "img", `banner-level-${level}.svg`));
+  }
+  const gameJs = fs.readFileSync(path.join(gameDir, "game.js"), "utf8");
+  const threeVersion = (gameJs.match(/const THREE_VERSION = "([^"]+)"/) || [])[1];
+  if (!threeVersion) {
+    throw new Error("Guinea Run: THREE_VERSION not found in game.js");
+  }
+  const threeUrl = `https://cdn.jsdelivr.net/npm/three@${threeVersion}/build/three.webgpu.min.js`;
+  const hash = crypto.createHash("sha256").update(threeUrl);
+  const relative = [];
+  for (const file of files) {
+    if (!fs.existsSync(file)) {
+      throw new Error(`Guinea Run offline: ${path.relative(OUT, file)} is missing`);
+    }
+    const name = path.relative(gameDir, file).split(path.sep).join("/");
+    relative.push(name);
+    hash.update(name).update(fs.readFileSync(file));
+  }
+  const version = hash.digest("hex").slice(0, 16);
+  const swPath = path.join(gameDir, "sw.js");
+  const source = fs.readFileSync(swPath, "utf8");
+  const built = source
+    .replace('const VERSION = "dev";', `const VERSION = ${JSON.stringify(version)};`)
+    .replace("const FILES = [];", `const FILES = ${JSON.stringify(relative, null, 2)};`)
+    .replace('const THREE_URL = "";', `const THREE_URL = ${JSON.stringify(threeUrl)};`);
+  if (built === source || built.includes('const VERSION = "dev"')) {
+    throw new Error("Guinea Run offline: sw.js placeholders not found");
+  }
+  fs.writeFileSync(swPath, built, "utf8");
+  return relative.length;
+}
+const offlineFileCount = guineaRunOfflineFiles();
+
+console.log(`site-src assembled: ${pages} lab page(s), ${backlogs} backlog page(s), ${stories} story page(s), ${assets} asset(s), ${themeFiles} theme file(s), ${badgePageCount} badge page(s), ${statsPageCount} statistics page(s), ${hallOfFamePageCount} Hall of Fame page(s), ${offlineFileCount} Guinea Run offline file(s), ${badgeRecords} badge record(s), ${locales.length} locale(s)`);
